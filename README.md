@@ -15,7 +15,7 @@
 > set the repository variable `DOCKERHUB_NAMESPACE` as described in the
 > [fork setup guide](https://vectrastack2.github.io/tgdcfs/docs/developers/fork-setup/).
 
-# TGDCFS
+# tgdcfs
 
 **Telegram and Discord as storage backends behind one WebDAV and SFTP
 server.**
