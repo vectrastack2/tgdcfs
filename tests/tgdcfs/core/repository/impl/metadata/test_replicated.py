@@ -389,7 +389,7 @@ class TestPush:
             layer.metadata.dir.create_dir("b")
             await layer.push()
 
-        mirror.push_full = push_full_while_a_push_lands
+        setattr(mirror, "push_full", push_full_while_a_push_lands)
 
         await layer.heal()
 
@@ -397,7 +397,7 @@ class TestPush:
         assert layer.stale_stores() == ["mirror"]
         assert mirror.push_full_calls == 1
 
-        mirror.push_full = original
+        setattr(mirror, "push_full", original)
         await layer.heal()
 
         assert layer.stale_stores() == []
