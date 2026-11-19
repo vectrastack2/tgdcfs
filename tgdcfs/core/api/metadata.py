@@ -42,6 +42,34 @@ class MetaDataApi:
             return
         await self.__metadata_repo.push()
 
+    def begin_batch(self) -> None:
+        """Collapse every push until :meth:`end_batch` into one write.
+
+        The bracket form of :meth:`batch`, for callers that cannot wrap the
+        operation in an ``async with``: an SFTP client removes a folder file
+        by file, in requests of its own.
+        """
+        self.__metadata_repo.begin_batch()
+        self.__batch_depth += 1
+
+    async def end_batch(self) -> None:
+        """Close the bracket opened by :meth:`begin_batch`; writes once.
+
+        The write happens whatever the outcome of the operation was: the
+        part that did go through has to be recorded.
+        """
+        if not self.__batch_depth:
+            return
+        self.__batch_depth -= 1
+        if self.__batch_depth:
+            return
+        try:
+            await self.__metadata_repo.end_batch()
+        finally:
+            if self.__pending:
+                self.__pending = False
+                await self.__metadata_repo.push()
+
     def get_root_directory(self) -> TGFSDirectory:
         return self.__metadata_repo.root()
 
@@ -61,6 +89,15 @@ class MetaDataApi:
         self, directories: Iterable[TGFSDirectory], keep: bool
     ) -> None:
         await self.__metadata_repo.save_stats(directories, keep)
+
+    def schedule_stats(self, directories: Iterable[TGFSDirectory]) -> bool:
+        """Hand ``directories`` to the next metadata write instead of a
+        stats write of their own, when the store can carry them along.
+
+        Every removal marks its folder for a stats rewrite, and a stats
+        commit of its own made removing a folder two commits per file.
+        """
+        return self.__metadata_repo.schedule_stats(directories)
 
     # -- metadata redundancy -------------------------------------------------
 

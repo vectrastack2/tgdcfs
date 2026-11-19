@@ -219,6 +219,21 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
 
     # -- writing ---------------------------------------------------------------
 
+    def begin_batch(self) -> None:
+        """Fold the writes of a bulk operation into one, for every store."""
+        for store in self._stores:
+            store.repo.begin_batch()
+
+    async def end_batch(self) -> None:
+        for store in self._stores:
+            await store.repo.end_batch()
+
+    def schedule_stats(self, directories: Iterable[TGFSDirectory]) -> bool:
+        """Let the stores that can carry stats along take them; the others
+        need their own stats write, so the caller is told to make one."""
+        taken = [store.repo.schedule_stats(directories) for store in self._stores]
+        return all(taken)
+
     async def push(self) -> None:
         if not self.metadata:
             raise MetadataNotInitialized()

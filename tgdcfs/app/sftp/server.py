@@ -1,13 +1,16 @@
 import asyncio
 import contextlib
+import contextvars
 import functools
 import logging
 import os.path
+import time
 from typing import (
     Any,
     AsyncIterator,
     Awaitable,
     Callable,
+    Dict,
     List,
     Optional,
     TypeVar,
@@ -57,6 +60,11 @@ logger = logging.getLogger(__name__)
 # The connection-level key under which the authenticated user is stashed so
 # the SFTP session -- created later, per channel -- can pick it up again.
 USER_INFO_KEY = "tgdcfs_user"
+
+# How long a removal may keep collecting further removals before its metadata
+# is written, and how long the client has to be quiet for that.
+BULK_QUIET_SECONDS = 0.75
+BULK_MAX_SECONDS = 2.0
 
 T = TypeVar("T")
 
@@ -218,6 +226,8 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
             "anonymous"
         )
         self._handles: List[Union[ReadHandle, WriteHandle]] = []
+        # Clients per open metadata batch, see ``_bulk_operation``.
+        self._batch_depth: Dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # helpers
@@ -241,6 +251,45 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
 
     def _ops(self, resolved: ResolvedPath) -> Ops:
         return Ops(self._client(resolved.client_name))
+
+    # ------------------------------------------------------------------
+    # bulk operations
+    # ------------------------------------------------------------------
+    #
+    # FileZilla removes a folder file by file: one SSH_FXP_REMOVE (and one
+    # SSH_FXP_RMDIR per subfolder) after another, and every request used to
+    # write the metadata on its own -- a commit per file to a tree store,
+    # two with the stats, which took over three minutes for two files and
+    # hours for a folder of thousands. A removal of the client's is folded
+    # into one metadata write per quiet moment instead: requests that keep
+    # coming (a pipelining client sends them without waiting for an answer)
+    # stay in the same write, and the write happens as soon as the client
+    # has been quiet for BULK_QUIET_SECONDS or once the operation has run
+    # for BULK_MAX_SECONDS, whichever comes first.
+
+    def _bulk_operation(self, client: str) -> "_BulkOperation":
+        return _BulkOperation(self, client)
+
+    def _metadata_api(self, client: str):
+        return getattr(self._client(client), "metadata_api", None)
+
+    def _begin_batch(self, client: str) -> None:
+        depth = self._batch_depth.get(client, 0)
+        if not depth:
+            metadata_api = self._metadata_api(client)
+            if metadata_api is not None:
+                metadata_api.begin_batch()
+        self._batch_depth[client] = depth + 1
+
+    async def _end_batch(self, client: str) -> None:
+        depth = self._batch_depth.get(client, 0) - 1
+        if depth > 0:
+            self._batch_depth[client] = depth
+            return
+        self._batch_depth.pop(client, None)
+        metadata_api = self._metadata_api(client)
+        if metadata_api is not None:
+            await metadata_api.end_batch()
 
     def _dir(self, resolved: ResolvedPath) -> TGFSDirectory:
         client = self._client(resolved.client_name)
@@ -547,7 +596,8 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
             raise asyncssh.SFTPPermissionDenied(
                 "Clients are configured, not removed over SFTP"
             )
-        await self._ops(resolved).rm_dir(resolved.relative, recursive=False)
+        async with self._bulk_operation(resolved.client_name):
+            await self._ops(resolved).rm_dir(resolved.relative, recursive=False)
 
     @translate_errors
     async def remove(self, path: bytes) -> None:
@@ -555,7 +605,8 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
         resolved = resolve(path)
         if resolved.is_root or resolved.is_client_root:
             raise asyncssh.SFTPPermissionDenied("Cannot remove a client root")
-        await self._ops(resolved).rm_file(resolved.relative)
+        async with self._bulk_operation(resolved.client_name):
+            await self._ops(resolved).rm_file(resolved.relative)
 
     @translate_errors
     async def rename(self, oldpath: bytes, newpath: bytes) -> None:
@@ -718,3 +769,75 @@ __all__ = [
     "make_server_factory",
     "make_sftp_factory",
 ]
+
+
+class _BulkOperation:
+    """One client's run of removals, folded into as few metadata writes as
+    possible.
+
+    Entered by every ``remove`` and ``rmdir``. The first one opens the
+    batch and starts a flush task; the ones that arrive while the batch is
+    open join it. The batch closes after ``BULK_QUIET_SECONDS`` without a
+    new request, or ``BULK_MAX_SECONDS`` after it opened, and the flush
+    writes whatever changed once. ``BULK_MAX_SECONDS`` is what keeps a
+    client that removes for hours (or a deletion the client abandons
+    halfway) from holding the metadata in memory: every write records
+    everything that happened so far.
+
+    The batch is bound to the task that opened it -- an SFTP request runs in
+    its own task -- so a client removing while another one uploads never
+    joins its write.
+    """
+
+    _current: contextvars.ContextVar[Optional["_BulkOperation"]] = (
+        contextvars.ContextVar("tgdcfs_sftp_bulk_operation", default=None)
+    )
+
+    def __init__(self, server: TGFSSFTPServer, client: str):
+        self._server = server
+        self._client = client
+        self._last_request = 0.0
+        self._opened_at = 0.0
+        self._flusher: Optional[asyncio.Task[None]] = None
+        self._closed = False
+
+    async def __aenter__(self) -> "_BulkOperation":
+        current = self._current.get()
+        if current is not None and current._client == self._client:
+            if not current._closed:
+                current._last_request = time.monotonic()
+                self._joined = current
+                return current
+        self._joined = None
+        self._opened_at = self._last_request = time.monotonic()
+        self._server._begin_batch(self._client)
+        self._current.set(self)
+        self._flusher = asyncio.ensure_future(self._flush_when_quiet())
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        if getattr(self, "_joined", None) is not None:
+            # The operation that owns the batch writes when it is done.
+            return
+        await self._close()
+
+    async def _flush_when_quiet(self) -> None:
+        while True:
+            due = min(self._last_request + BULK_QUIET_SECONDS, self._opened_at + BULK_MAX_SECONDS)
+            delay = due - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if time.monotonic() >= self._last_request + BULK_QUIET_SECONDS:
+                break
+            if time.monotonic() >= self._opened_at + BULK_MAX_SECONDS:
+                break
+        await self._close()
+
+    async def _close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._server._end_batch(self._client)
+        except Exception:  # never lose the client's answer over a write
+            logger.exception("Writing the metadata of a bulk removal failed")

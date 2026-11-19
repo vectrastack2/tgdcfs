@@ -298,14 +298,36 @@ class GithubDirectory(TGFSDirectory):
         return github_child
 
     def delete(self) -> None:
-        if self.parent:
-            # Remove all files and subdirectories from GitHub
-            self._delete_github_directory()
+        # Kept for the tree API: it only takes the folder out of the tree.
+        # Removing the blobs is a commit of its own and has to go through
+        # ``delete_async`` (a folder is removed with ``rm_dir``).
         super().delete()
+
+    async def delete_async(self) -> None:
+        """Remove this folder from the tree and its blobs from the repo.
+
+        The commit runs on the writer thread, like every other write: a
+        blocking delete froze the event loop and held the writer's turn.
+        """
+        path = self._github_path if self.parent is not None else ""
+        super().delete()
+        if not path:
+            return
+        await self._ghc.write(self._delete_github_path, path)
 
     def move_to(
         self, new_parent: TGFSDirectory, new_name: Optional[str] = None
     ) -> None:
+        # Re-parenting in the tree only; the blobs move in ``move_to_async``.
+        super().move_to(new_parent, new_name)
+
+    async def move_to_async(
+        self, new_parent: TGFSDirectory, new_name: Optional[str] = None
+    ) -> None:
+        """Re-parent this directory and re-path its blobs in one commit.
+
+        The commit runs on the writer thread, like every other write.
+        """
         old_parent, old_name = self.parent, self.name
         old_prefix = self._github_path
         super().move_to(new_parent, new_name)
@@ -313,7 +335,9 @@ class GithubDirectory(TGFSDirectory):
         if not old_prefix or not new_prefix or old_prefix == new_prefix:
             return
         try:
-            self._move_github_directory(old_prefix, new_prefix)
+            await self._ghc.write(
+                self._move_github_directory, old_prefix, new_prefix
+            )
         except Exception:
             # The repo *is* the metadata here, so an in-memory tree that the
             # repo does not back would only survive until the next reload.
@@ -331,7 +355,7 @@ class GithubDirectory(TGFSDirectory):
         The Contents API has no rename, and deleting plus re-creating every
         blob would lose the git history the timestamps are restored from, so
         rewrite the tree with the affected blobs moved to their new paths --
-        the same Git Data API round-trip ``_delete_github_directory`` uses.
+        the same Git Data API round-trip ``_delete_github_path`` uses.
         """
         try:
             ref = self._ghc.repo.get_git_ref(f"heads/{self._ghc.commit}")
@@ -547,8 +571,8 @@ class GithubDirectory(TGFSDirectory):
                 f"from {self._ghc.repo_name}: not found"
             )
 
-    def _delete_github_directory(self) -> None:
-        """Remove this directory and everything beneath it in one commit.
+    def _delete_github_path(self, prefix: str) -> None:
+        """Remove ``prefix`` and everything beneath it in one commit.
 
         ``delete_file`` can only remove a single file — it returns HTTP 422
         on a subtree — so a per-entry delete cannot recurse into
@@ -557,9 +581,6 @@ class GithubDirectory(TGFSDirectory):
         directory's path, dropping arbitrarily-nested content atomically in
         a single commit via the Git Data API.
         """
-        prefix = self._github_path
-        if not prefix:
-            return  # guard: never wipe the whole repo via the root
         try:
             ref = self._ghc.repo.get_git_ref(f"heads/{self._ghc.commit}")
             base_commit = self._ghc.repo.get_git_commit(ref.object.sha)

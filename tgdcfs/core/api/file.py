@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import logging
 from typing import (
@@ -33,6 +34,11 @@ logger = logging.getLogger(__name__)
 
 # {mirror store key -> message ids to delete there}
 MirrorMessageIds = Dict[str, List[int]]
+
+# Descriptor reads a bulk removal keeps in flight at once. Every store batches
+# the reads it is handed, so this is what turns one round trip per deleted file
+# into one per handful of files.
+DELETE_LOOKUPS_IN_FLIGHT = 8
 
 
 def _merge_mirror_ids(target: MirrorMessageIds, source: Dict[str, int]) -> None:
@@ -71,6 +77,7 @@ class FileApi:
         self._written_gaps_only = written_gaps_only
         # What listings show of a file; see ``FileStatApi``.
         self.stats = stat_api or FileStatApi(file_desc_api)
+        self._delete_lookups_in_flight = DELETE_LOOKUPS_IN_FLIGHT
 
     async def _written(self, fr: TGFSFileRef, fd: Optional[TGFSFileDesc]) -> None:
         if self._on_written is None:
@@ -219,10 +226,17 @@ class FileApi:
         Refs whose descriptor is still referenced by a file outside ``frs``
         contribute nothing: their messages are shared and must stay.
         ``version_ids`` collects the ids of the versions that go with them.
+
+        The descriptors are read a few at a time, not one after the other:
+        a client removing a folder hands over hundreds of files at once and
+        every descriptor is a store round trip of its own. ``version_ids``
+        is filled in submission order either way.
         """
         shared = self._descriptors_referenced_elsewhere(frs)
         ids: List[int] = []
         mirror_ids: MirrorMessageIds = {}
+
+        to_look_up: List[TGFSFileRef] = []
         for fr in frs:
             if fr.message_id in shared:
                 logger.info(
@@ -230,7 +244,20 @@ class FileApi:
                     f"(descriptor {fr.message_id}): another file still refers to them"
                 )
                 continue
-            fr_ids, fr_mirror_ids = await self.collect_all_message_ids(fr, version_ids)
+            to_look_up.append(fr)
+
+        slots = asyncio.Semaphore(max(1, self._delete_lookups_in_flight))
+
+        async def look_up(
+            fr: TGFSFileRef, version_ids: Optional[List[str]]
+        ) -> Tuple[List[int], MirrorMessageIds]:
+            async with slots:
+                return await self.collect_all_message_ids(fr, version_ids)
+
+        results = await asyncio.gather(
+            *(look_up(fr, version_ids) for fr in to_look_up)
+        )
+        for fr_ids, fr_mirror_ids in results:
             ids.extend(fr_ids)
             for channel_key, channel_ids in fr_mirror_ids.items():
                 mirror_ids.setdefault(channel_key, []).extend(channel_ids)

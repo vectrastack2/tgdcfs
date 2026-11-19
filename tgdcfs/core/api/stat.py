@@ -296,6 +296,16 @@ class FileStatApi:
         batch, self._dirty = self._dirty, {}
         self._dirty_since = None
         self._urgent = False
+        if self._metadata_api is not None and self._metadata_api.schedule_stats(
+            batch.values()
+        ):
+            # The store carries them on its next tree write: one commit for
+            # a folder removal instead of a stats commit per file.
+            logger.info(
+                f"Carrying the file stats of {len(batch)} folder(s) on the "
+                f"next metadata write"
+            )
+            return True
         logger.info(f"Writing the file stats of {len(batch)} folder(s)")
         started = time.monotonic()
         try:

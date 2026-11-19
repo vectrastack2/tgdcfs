@@ -131,6 +131,21 @@ class IMetaDataRepository(metaclass=ABCMeta):
     async def get(self) -> TGFSMetadata:
         pass
 
+    def begin_batch(self) -> None:
+        """Start a bulk operation; the ``push`` calls until ``end_batch``
+        are folded into a single write where the store can do that.
+
+        A client removing a folder hands its files over one by one; with
+        one write per ``push`` a tree store commits once per file and a
+        document store rewrites its whole document once per file. The
+        default has nothing to fold.
+        """
+
+    async def end_batch(self) -> None:
+        """End the bulk operation started by ``begin_batch``: write what
+        is pending in a single write, also when the operation failed
+        halfway -- whatever did change is real and has to be recorded."""
+
     async def heal(self) -> None:
         """Re-sync every store this repository knows to be behind.
 
@@ -177,6 +192,14 @@ class IMetaDataRepository(metaclass=ABCMeta):
                 fr.stat is not None for fr in _iter_file_refs(self.root())
             )
         return self._tree_has_stats
+
+    def schedule_stats(self, directories: Iterable[TGFSDirectory]) -> bool:
+        """Mark ``directories`` for the next ``save_stats`` call.
+
+        Returns whether the store took them; False means the caller has to
+        call ``save_stats`` itself.
+        """
+        return False
 
     async def save_stats(
         self, directories: Iterable[TGFSDirectory], keep: bool

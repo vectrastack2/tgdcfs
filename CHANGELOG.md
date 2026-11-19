@@ -18,6 +18,27 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
+- Removing files and folders over SFTP is no longer slow. FileZilla
+  removes a folder one entry at a time -- an ``SSH_FXP_REMOVE`` per file,
+  an ``SSH_FXP_RMDIR`` per folder -- and every one of those requests wrote
+  the metadata on its own: a commit per file to a git metadata store, two
+  with ``listing.stat_in_metadata`` on (one for the file reference, one
+  for the folder's stats file), so removing two files took over three
+  minutes and a folder of a few thousand files hours. The server now keeps
+  one metadata batch open for a run of removals and writes once when the
+  client goes quiet (or every couple of seconds during a long deletion), a
+  recursive ``rm_dir`` is one write, and the descriptors of the files being
+  removed are read a few at a time instead of strictly one after another.
+  A git tree store carries the stats of the folders a removal touched on
+  that same commit, so a folder of ten thousand files costs two commits
+  instead of twenty thousand.
+- The GitHub metadata store no longer blocks the event loop on a folder
+  delete or move: the tree rewrite and the commit run on the store's writer
+  thread like every other write. ``GithubDirectory.delete()`` and
+  ``move_to()`` only change the tree now; the blobs are removed and moved
+  through ``delete_async()`` and ``move_to_async()``, which ``rm_dir`` and
+  ``mv_dir`` use.
+
 - The file data of a replicated file system now heals itself the way the
   metadata does. With ``sync: tee`` a mirror write that failed (a mirror
   store being temporarily down, for instance) was detected and the file's

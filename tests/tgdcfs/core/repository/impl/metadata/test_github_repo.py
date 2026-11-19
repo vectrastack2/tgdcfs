@@ -928,7 +928,8 @@ class TestGithubDirectory:
         # File should still be removed from local structure
         assert file_ref not in directory.files
 
-    def test_delete_directory(self, mock_ghc):
+    @pytest.mark.asyncio
+    async def test_delete_directory(self, mock_ghc):
         """Deleting a directory rewrites the tree without its whole subtree."""
 
         def blob(path):
@@ -966,7 +967,7 @@ class TestGithubDirectory:
         directory = GithubDirectory(mock_ghc, "testdir", parent)
         parent.children.append(directory)
 
-        directory.delete()
+        await directory.delete_async()
 
         # New tree keeps only the unrelated blob (both testdir blobs dropped).
         kept = mock_ghc.repo.create_git_tree.call_args[0][0]
@@ -978,7 +979,8 @@ class TestGithubDirectory:
         assert directory not in parent.children
 
     @patch("tgdcfs.core.repository.impl.metadata.github_repo.gh_directory.logger")
-    def test_delete_directory_handles_errors(self, mock_logger, mock_ghc):
+    @pytest.mark.asyncio
+    async def test_delete_directory_handles_errors(self, mock_logger, mock_ghc):
         """Test deleting directory with error handling"""
         mock_ghc.repo.get_git_ref.side_effect = Exception("Access denied")
 
@@ -988,7 +990,7 @@ class TestGithubDirectory:
         directory = GithubDirectory(mock_ghc, "testdir", parent)
         parent.children.append(directory)
 
-        directory.delete()
+        await directory.delete_async()
 
         # Should log error
         mock_logger.error.assert_called_once()
@@ -998,7 +1000,8 @@ class TestGithubDirectory:
         # Directory should still be removed from parent
         assert directory not in parent.children
 
-    def test_move_directory(self, mock_ghc):
+    @pytest.mark.asyncio
+    async def test_move_directory(self, mock_ghc):
         """Moving a directory re-paths its whole subtree in one commit."""
 
         def blob(path):
@@ -1039,7 +1042,7 @@ class TestGithubDirectory:
         moving = GithubDirectory(mock_ghc, "moving", src)
         src.children.append(moving)
 
-        moving.move_to(dest)
+        await moving.move_to_async(dest)
 
         elements = mock_ghc.repo.create_git_tree.call_args[0][0]
         assert sorted(e._identity["path"] for e in elements) == [
@@ -1052,7 +1055,8 @@ class TestGithubDirectory:
         assert dest.children == [moving]
         assert src.children == []
 
-    def test_move_directory_rolls_back_when_the_repo_write_fails(self, mock_ghc):
+    @pytest.mark.asyncio
+    async def test_move_directory_rolls_back_when_the_repo_write_fails(self, mock_ghc):
         mock_ghc.repo.get_git_ref.side_effect = Exception("Access denied")
 
         root = GithubDirectory(mock_ghc, "root", None)
@@ -1063,7 +1067,7 @@ class TestGithubDirectory:
         src.children.append(moving)
 
         with pytest.raises(Exception, match="Access denied"):
-            moving.move_to(dest)
+            await moving.move_to_async(dest)
 
         # The repo is the metadata, so a move it did not record must not stick.
         assert moving.parent is src

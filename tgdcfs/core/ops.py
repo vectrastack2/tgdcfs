@@ -82,7 +82,7 @@ class Ops:
 
     def _metadata_batch(self) -> AbstractAsyncContextManager[None]:
         """Collapse the metadata writes of a bulk operation into one."""
-        metadata_api = self._client.metadata_api
+        metadata_api = getattr(self._client, "metadata_api", None)
         return metadata_api.batch() if metadata_api else nullcontext()
 
     async def _copy_dir_into(
@@ -187,7 +187,8 @@ class Ops:
         dir_to_remove = d.find_dir(basename)
 
         if recursive:
-            await self._client.dir_api.rm_dangerously(dir_to_remove)
+            async with self._metadata_batch():
+                await self._client.dir_api.rm_dangerously(dir_to_remove)
         else:
             await self._client.dir_api.rm_empty(dir_to_remove)
 

@@ -69,6 +69,9 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
     ):
         super().__init__()
         self._stats_loads: dict[int, asyncio.Future[bool]] = {}
+        # Folders whose stats are carried on the next full tree sync, see
+        # ``schedule_stats``.
+        self._stats_due: Set[int] = set()
 
         gh = Github(config.access_token, retry=GithubRetry(total=1))
         # Injectable for a store that speaks the PyGithub surface without
@@ -193,7 +196,16 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         # GitHub round trips run on the writer thread.
         async with self._ghc.lock:
             desired_blobs = self._desired_blobs()
-            await self._ghc.write(self._sync_tree_commit, desired_blobs)
+            stats = self._desired_stats()
+            self._stats_due.clear()
+            await self._ghc.write(self._sync_tree_commit, desired_blobs, stats)
+
+    def _desired_stats(self) -> dict[str, Optional[str]]:
+        """The stats blobs the scheduled folders imply."""
+        blobs: dict[str, Optional[str]] = {}
+        for directory in self._folders_with_stats_due(self._stats_due):
+            blobs[directory.stats_path] = self._stats_content(directory)
+        return blobs
 
     def _desired_blobs(self) -> Set[str]:
         """The blob paths the in-memory tree implies."""
@@ -263,13 +275,20 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         _, _, suffix = segment.rpartition(".")
         return suffix.isdigit()
 
-    def _sync_tree_commit(self, desired_blobs: Set[str]) -> None:
+    def _sync_tree_commit(
+        self,
+        desired_blobs: Set[str],
+        stats: Optional[dict[str, Optional[str]]] = None,
+    ) -> None:
         """Diff the repo against the desired blobs and commit the delta.
 
         Blocking; raises when the sync cannot be done safely. Retried when
         the branch moved under it, like the stats commit. A repo without
-        the branch yet (a fresh mirror) gets an initial commit.
+        the branch yet (a fresh mirror) gets an initial commit. ``stats``
+        are the stats blobs to write in the same commit (``None`` drops a
+        folder's stats file), see ``schedule_stats``.
         """
+        stats = stats or {}
         repo = self._ghc.repo
         for attempt in range(SYNC_COMMIT_ATTEMPTS):
             try:
@@ -295,7 +314,21 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
                 for path in current
                 if path not in desired_blobs and self._is_managed_blob(path)
             )
-            if not creates and not deletes:
+            # A stats file the tree sync does not manage is only dropped
+            # when the caller says so, and a folder that keeps its stats
+            # (a move or a rename) keeps its file too.
+            stats_writes = {
+                path: content
+                for path, content in stats.items()
+                if content is not None
+                and (path not in current or _blob_sha(content) != current[path][0])
+            }
+            stats_deletes = [
+                path
+                for path, content in stats.items()
+                if content is None and path in current
+            ]
+            if not creates and not deletes and not stats_writes and not stats_deletes:
                 return
             elements = [
                 # The content creates the blob server side; an element that
@@ -304,9 +337,16 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
                 for path in creates
             ]
             elements += [
+                InputGitTreeElement(
+                    path=path, mode="100644", type="blob", content=content
+                )
+                for path, content in sorted(stats_writes.items())
+            ]
+            gone = set(deletes) | set(stats_deletes)
+            elements += [
                 InputGitTreeElement(path=path, mode=mode, type="blob", sha=sha)
                 for path, (sha, mode) in sorted(current.items())
-                if path not in set(deletes)
+                if path not in gone
             ]
             new_tree = repo.create_git_tree(elements)
             commit = repo.create_git_commit(
@@ -320,7 +360,8 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
                 logger.info(
                     f"Synced the metadata tree to {self._ghc.repo_name}@"
                     f"{self._ghc.commit}: {len(creates)} created, "
-                    f"{len(deletes)} deleted"
+                    f"{len(deletes)} deleted, "
+                    f"{len(stats_writes) + len(stats_deletes)} stats file(s) written"
                 )
                 return
             except GithubException as ex:
@@ -406,6 +447,23 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             directory.stats_sha is not None
         )
 
+    def schedule_stats(self, directories: Iterable[TGFSDirectory]) -> bool:
+        """Carry the stats of ``directories`` on the next tree sync.
+
+        A stats commit of its own made removing a folder cost two commits
+        per file; folded into the sync of the removal, a folder of ten
+        thousand files is two commits instead of twenty thousand. Only a
+        store that writes its tree by diffing (``push_full``) can do this:
+        the other shapes write nothing there, so they say no and the caller
+        writes the stats itself.
+        """
+        if type(self).push_full is GithubRepoMetadataRepository.push_full:
+            return False
+        for directory in directories:
+            if isinstance(directory, GithubDirectory) and directory.is_attached():
+                self._stats_due.add(id(directory))
+        return True
+
     async def save_stats(
         self, directories: Iterable[TGFSDirectory], keep: bool
     ) -> None:
@@ -417,7 +475,11 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         changes: list[tuple[GithubDirectory, Optional[str]]] = []
         unreadable: list[str] = []
         # Directories compare by content, so they are told apart by identity.
-        for directory in {id(d): d for d in directories}.values():
+        scheduled, self._stats_due = self._stats_due, set()
+        due = list(directories)
+        if scheduled:
+            due.extend(self._folders_with_stats_due(scheduled))
+        for directory in {id(d): d for d in due}.values():
             if not isinstance(directory, GithubDirectory):
                 continue
             if not directory.is_attached():
@@ -449,6 +511,21 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             raise TechnicalError(
                 f"Could not read the stored stats of {', '.join(unreadable)}"
             )
+
+    def _folders_with_stats_due(self, ids: Set[int]) -> list[GithubDirectory]:
+        """The scheduled folders that are still in the tree; blocking, reads
+        the tree the write is about to serialize anyway."""
+        found: list[GithubDirectory] = []
+
+        def walk(directory: TGFSDirectory) -> None:
+            if isinstance(directory, GithubDirectory) and id(directory) in ids:
+                found.append(directory)
+            for child in directory.find_dirs():
+                walk(child)
+
+        root = self.root()
+        walk(root)
+        return found
 
     @staticmethod
     def _stats_content(directory: GithubDirectory) -> Optional[str]:
