@@ -11,7 +11,7 @@ client goes quiet.
 
 import asyncio
 import time
-from typing import cast
+from typing import Dict, cast
 
 import pytest
 
@@ -131,7 +131,10 @@ class TestSFTPBulkRemoval:
     @staticmethod
     def _server(metadata_api) -> TGFSSFTPServer:
         server = object.__new__(TGFSSFTPServer)
-        server._clients = {"test": _ClientWithMetadata(metadata_api)}
+        clients: Dict[str, Client] = {
+            "test": cast(Client, _ClientWithMetadata(metadata_api))
+        }
+        server._clients = clients
         server._batch_depth = {}
         return server
 

@@ -800,9 +800,10 @@ class _BulkOperation:
         self._opened_at = 0.0
         self._flusher: Optional[asyncio.Task[None]] = None
         self._closed = False
+        self._joined: Optional["_BulkOperation"] = None
 
     async def __aenter__(self) -> "_BulkOperation":
-        current = self._current.get()
+        current: Optional["_BulkOperation"] = self._current.get()
         if current is not None and current._client == self._client:
             if not current._closed:
                 current._last_request = time.monotonic()
@@ -816,7 +817,7 @@ class _BulkOperation:
         return self
 
     async def __aexit__(self, *exc_info: object) -> None:
-        if getattr(self, "_joined", None) is not None:
+        if self._joined is not None:
             # The operation that owns the batch writes when it is done.
             return
         await self._close()
