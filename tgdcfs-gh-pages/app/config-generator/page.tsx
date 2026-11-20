@@ -2191,12 +2191,18 @@ export default function ConfigGenerator() {
                 <SyntaxHighlighter
                   language="yaml"
                   style={vscDarkPlus}
+                  wrapLongLines
                   customStyle={{
                     fontSize: "0.75rem",
                     margin: 0,
                     background: "transparent",
-                    overflowX: "auto",
-                    whiteSpace: "pre",
+                  }}
+                  codeTagProps={{
+                    style: {
+                      ...vscDarkPlus["code[class*=\"language-\"]"],
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-word",
+                    },
                   }}
                 >
                   {generateYaml()}

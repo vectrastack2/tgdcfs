@@ -218,7 +218,7 @@ function MetadataStoreEditor({
                   )
                 }
                 helperText="Compact the commit history once it grows past this many commits (0 = off)"
-                style={{ width: 220, flex: "none" }}
+                width={220}
               />
             )}
           </Box>
@@ -314,7 +314,7 @@ function MetadataStoreEditor({
                   )
                 }
                 helperText="Parallel blob reads during a full-tree sync; default: 8"
-                style={{ width: 220, flex: "none" }}
+                width={220}
               />
             )}
             {entry.gitlab_repo.layout === "tree" && (
@@ -328,7 +328,7 @@ function MetadataStoreEditor({
                   )
                 }
                 helperText="Compact the commit history once it grows past this many commits (0 = off)"
-                style={{ width: 220, flex: "none" }}
+                width={220}
               />
             )}
           </Box>
@@ -461,7 +461,7 @@ export function FilesystemField({
               })
             }
             helperText="Pushes landing within the window share one write; default: 300"
-            style={{ width: 220, flex: "none" }}
+            width={220}
           />
         )}
       </Box>
@@ -554,7 +554,7 @@ export function FilesystemField({
       <Box sx={{ display: "flex", flexWrap: "wrap", alignItems: "flex-start", gap: 1, mb: 1 }}>
         <FormControl
           size="small"
-          sx={{ minWidth: 300, flex: 1 }}
+          sx={{ flex: 1, minWidth: { xs: 0, sm: 300 } }}
           error={mirrorErrors.length > 0}
         >
           <InputLabel>Mirror Stores</InputLabel>
@@ -669,7 +669,7 @@ export function FilesystemField({
           />
           {filesystem.read_parallel && (
             <>
-              <FormControl size="small" sx={{ minWidth: 300, mb: 1 }}>
+              <FormControl size="small" sx={{ minWidth: { xs: "100%", sm: 300 }, mb: 1 }}>
                 <InputLabel>Stores taking part (empty: all)</InputLabel>
                 <Select
                   multiple
@@ -719,7 +719,7 @@ export function FilesystemField({
           )}
           {cacheEnabled && (
             <>
-              <FormControl size="small" sx={{ minWidth: 260, mb: 1 }}>
+              <FormControl size="small" sx={{ minWidth: { xs: "100%", sm: 260 }, mb: 1 }}>
                 <InputLabel>Write acknowledgement</InputLabel>
                 <Select
                   value={filesystem.write_ack}

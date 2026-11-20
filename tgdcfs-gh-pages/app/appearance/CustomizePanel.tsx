@@ -23,6 +23,7 @@ import {
 const panelSx = {
   p: 3,
   width: 300,
+  maxWidth: "calc(100vw - 32px)",
   mt: 1,
   bgcolor: "#0d1526",
   color: "#e2e8f0",
