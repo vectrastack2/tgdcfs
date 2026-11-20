@@ -187,6 +187,12 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
     # whole in-memory tree is diffed against the repo and reconciled in one
     # commit.
 
+    async def push_async(self) -> None:
+        # A tree store writes incrementally as the tree is mutated; the
+        # push itself is a no-op (``push`` below), so there is nothing to
+        # take off the caller's thread.
+        await self.push()
+
     async def push_full(self) -> None:
         if not self.metadata:
             raise MetadataNotInitialized()

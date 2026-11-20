@@ -32,6 +32,17 @@ the fact on the commits that shipped them.
   A git tree store carries the stats of the folders a removal touched on
   that same commit, so a folder of ten thousand files costs two commits
   instead of twenty thousand.
+- The same removal no longer waits on a metadata mirror that is down. A
+  replicated metadata layer writes its stores one after another, so a
+  mirror that answered after its request timeout delayed every single
+  removal by that timeout -- with a hanging mirror the run went at
+  roughly one file a minute, whatever the batching did. The write that
+  closes a bulk operation now runs the stores concurrently and leaves one
+  that takes longer than ten seconds behind as stale; the heal brings it
+  in line once it answers again, and the client gets its answer.
+- A recursive delete is one write for the whole subtree: the folder is
+  dropped from the tree and its file references go with it, instead of
+  one commit per reference first.
 - The GitHub metadata store no longer blocks the event loop on a folder
   delete or move: the tree rewrite and the commit run on the store's writer
   thread like every other write. ``GithubDirectory.delete()`` and

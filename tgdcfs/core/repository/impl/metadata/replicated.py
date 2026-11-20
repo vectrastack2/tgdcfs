@@ -36,12 +36,13 @@ copy was beaten at load is handed the winner's tree like a stale one.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Sequence, Set
 
-from tgdcfs.core.model import TGFSDirectory, TGFSMetadata
+from tgdcfs.core.model import TGFSDirectory, TGFSFileRef, TGFSMetadata
 from tgdcfs.core.repository.interface import IMetaDataRepository
 from tgdcfs.errors import (
     MetadataBlobTooLarge,
@@ -64,6 +65,12 @@ EMPTY_METADATA_ERRORS = (NoPinnedMessage, NoStoredMetadata)
 # is newer by more than this much -- otherwise the primary keeps the
 # lead, and calm operation never flips the source of truth.
 PRIMARY_FRESHNESS_WINDOW_SECONDS = 60.0
+
+# How long a store may take on the write of a bulk operation (a run of
+# removals, a folder copy) before it is left behind as stale. The client
+# is waiting for its answer, and a store that is down or hanging used to
+# cost its full request timeout on every single removal.
+BULK_STORE_TIMEOUT_SECONDS = 10.0
 
 
 @dataclass
@@ -228,6 +235,10 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
         for store in self._stores:
             await store.repo.end_batch()
 
+    async def delete_file_refs(self, refs: Iterable[TGFSFileRef]) -> None:
+        for store in self._stores:
+            await store.repo.delete_file_refs(refs)
+
     def schedule_stats(self, directories: Iterable[TGFSDirectory]) -> bool:
         """Let the stores that can carry stats along take them; the others
         need their own stats write, so the caller is told to make one."""
@@ -259,6 +270,68 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
             raise TechnicalError(
                 "Writing the metadata failed for every store: " + "; ".join(errors)
             )
+
+    async def push_async(self) -> None:
+        """The write of a bulk operation: one store at a time, off the
+        event loop, and a store that hangs only holds up itself.
+
+        The plain :meth:`push` waits out every store in turn -- a mirror
+        that answers after its request timeout (or, on a blocking client,
+        after a read timeout of a minute) delays the client's answer for
+        that long, every time. During a run of removals that is the whole
+        run: the client waits for the write before it sends the next
+        removal. Here a store that takes longer than
+        :data:`BULK_STORE_TIMEOUT_SECONDS` is left behind as stale -- the
+        heal brings it in line once it answers again -- and the other
+        stores are still written.
+        """
+        if not self.metadata:
+            raise MetadataNotInitialized()
+        self._stamp_revision()
+
+        results = await asyncio.gather(
+            *(self._write_with_timeout(store, full=i > 0 or store.key in self._stale)
+              for i, store in enumerate(self._stores)),
+            return_exceptions=True,
+        )
+        any_store_ok = False
+        errors: List[str] = []
+        for store, result in zip(self._stores, results):
+            if isinstance(result, BaseException):
+                # _write already recorded the failure; this only keeps the
+                # rest of the group's outcome intact.
+                self._stale.add(store.key)
+                errors.append(f"{store.key}: {result}")
+                continue
+            ok, error = result
+            any_store_ok = any_store_ok or ok
+            if error:
+                errors.append(error)
+        if not any_store_ok:
+            raise TechnicalError(
+                "Writing the metadata failed for every store: " + "; ".join(errors)
+            )
+
+    async def _write_with_timeout(
+        self, store: MetadataStore, full: bool
+    ) -> tuple[bool, Optional[str]]:
+        try:
+            return await asyncio.wait_for(
+                self._write(store, full), timeout=BULK_STORE_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            reason = (
+                f"no answer within {BULK_STORE_TIMEOUT_SECONDS:g}s; "
+                f"left for the heal"
+            )
+            if store.key not in self._stale:
+                logger.warning(
+                    f"Writing the metadata to store {store.key} took longer "
+                    f"than {BULK_STORE_TIMEOUT_SECONDS:g}s; it is left for "
+                    f"the heal and the write goes on"
+                )
+            self._stale.add(store.key)
+            return False, f"{store.key}: {reason}"
 
     def _stamp_revision(self) -> None:
         """Date the tree being written, so the stores hold comparable

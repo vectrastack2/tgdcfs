@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Iterable, List
 
-from tgdcfs.core.model import TGFSDirectory, TGFSMetadata
+from tgdcfs.core.model import TGFSDirectory, TGFSFileRef, TGFSMetadata
 from tgdcfs.core.repository.interface import IMetaDataRepository
 
 
@@ -68,7 +68,14 @@ class MetaDataApi:
         finally:
             if self.__pending:
                 self.__pending = False
-                await self.__metadata_repo.push()
+                # Off the caller's path: the client that removed a folder
+                # is waiting for its answer and a store that hangs must
+                # not stall the run (see ``push_async``).
+                await self.__metadata_repo.push_async()
+
+    async def delete_file_refs(self, refs: Iterable[TGFSFileRef]) -> None:
+        """Drop the references of a removed folder in one write."""
+        await self.__metadata_repo.delete_file_refs(refs)
 
     def get_root_directory(self) -> TGFSDirectory:
         return self.__metadata_repo.root()

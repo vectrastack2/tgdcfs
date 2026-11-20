@@ -30,7 +30,14 @@ from tgdcfs.core.api.file_desc import FileDescApi
 from tgdcfs.core.api.metadata import MetaDataApi
 from tgdcfs.core.client import Client
 from tgdcfs.core.ops import Ops
+from tgdcfs.core.model import TGFSDirectory, TGFSMetadata
 from tgdcfs.core.repository.impl.fd.store_msg import StoreFDRepository
+from tgdcfs.core.repository.impl.metadata import replicated
+from tgdcfs.core.repository.impl.metadata.replicated import (
+    MetadataStore,
+    ReplicatedMetadataRepository,
+)
+from tgdcfs.core.repository.interface import IMetaDataRepository
 
 
 class BatchClient:
@@ -174,3 +181,47 @@ class TestSFTPBulkRemoval:
         assert metadata_api.end_batches >= 1
         started = time.monotonic()
         assert started > 0
+
+
+class _SlowStore(IMetaDataRepository):
+    """A metadata store that answers only when the test lets it."""
+
+    def __init__(self, gate: asyncio.Event) -> None:
+        super().__init__()
+        self._gate = gate
+        self.pushes = 0
+
+    async def get(self) -> TGFSMetadata:
+        return TGFSMetadata(dir=TGFSDirectory.root_dir())
+
+    async def push(self) -> None:
+        self.pushes += 1
+
+    async def push_full(self) -> None:
+        await self._gate.wait()
+        self.pushes += 1
+
+
+class TestBulkWriteDoesNotWaitForASlowStore:
+    @pytest.mark.asyncio
+    async def test_a_hanging_mirror_is_left_for_the_heal(self, monkeypatch):
+        monkeypatch.setattr(replicated, "BULK_STORE_TIMEOUT_SECONDS", 0.05)
+        gate = asyncio.Event()
+        primary = _SlowStore(gate)
+        gate.set()  # the primary answers at once
+        mirror = _SlowStore(asyncio.Event())  # the mirror never does
+        repo = ReplicatedMetadataRepository(
+            [
+                MetadataStore(key="primary", repo=primary, primary=True),
+                MetadataStore(key="mirror", repo=mirror),
+            ]
+        )
+        repo.metadata = TGFSMetadata(dir=TGFSDirectory.root_dir())
+
+        started = time.monotonic()
+        await repo.push_async()
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 1.0
+        assert primary.pushes == 1
+        assert "mirror" in repo.stale_stores()

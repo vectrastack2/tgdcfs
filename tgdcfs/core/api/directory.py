@@ -59,10 +59,17 @@ class DirectoryApi:
         return directory
 
     async def rm_dangerously(self, directory: TGFSDirectory) -> None:
+        refs = self.__subtree_file_refs(directory)
         message_ids, mirror_ids = await self.__file_api.collect_deletable_message_ids(
-            self.__subtree_file_refs(directory)
+            refs
         )
+        # One write for the whole subtree: dropping the folder from the
+        # tree is enough, a tree store commits that in a single go and a
+        # document store serializes the tree once. Removing the refs one
+        # by one first cost a commit per file, which is what made a
+        # folder of a few thousand files take hours.
         directory.delete()
+        await self.__metadata_api.delete_file_refs(refs)
         await self.__metadata_api.push()
         await self.__message_api.delete_messages(message_ids)
         await self.__file_api.delete_mirrored(mirror_ids)

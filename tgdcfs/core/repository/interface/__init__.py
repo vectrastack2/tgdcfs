@@ -115,6 +115,28 @@ class IMetaDataRepository(metaclass=ABCMeta):
     async def push(self) -> None:
         pass
 
+    async def push_async(self) -> None:
+        """Write the tree without holding up the caller.
+
+        Used for the write of a bulk operation, where the caller is a
+        client waiting for its answer: a store that is slow (a hanging
+        mirror, a rate-limited remote) must not stall the whole run. The
+        default is the plain write, which is what a local or in-memory
+        store already is.
+        """
+        await self.push()
+
+    async def delete_file_refs(self, refs: Iterable[TGFSFileRef]) -> None:
+        """Remove the references of a whole folder in one write.
+
+        ``rm`` drops a single ref and writes; a recursive delete used to
+        pay that per file, which is a commit per file on a tree store. The
+        default keeps the per-ref call for a store that has nothing to
+        fold.
+        """
+        for fr in refs:
+            await fr.delete_async()
+
     async def push_full(self) -> None:
         """Write the whole current tree to this store, however much of it
         is already there.
